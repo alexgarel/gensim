@@ -52,6 +52,22 @@ two tokens (e.g. `new_york_times`):
 >>> print(trigram[bigram[sent]])
 [u'the', u'new_york_times', u'is', u'a', u'newspaper']
 
+The common_terms parameter add a way to give special treatment to common terms (aka stop words)
+such that their presence between two words
+won't prevent bigram detection.
+It allows to detect expressions like "bank of america" or "eye of the beholder".
+
+>>> common_terms = ["of", "with", "without", "and", "or", "the", "a"]
+>>> ct_phrases = Phrases(sentence_stream, common_terms=common_terms)
+
+The phraser will of course inherit the common_terms from Phrases.
+
+>>> ct_bigram = Phraser(ct_phrases)
+>>> sent = [u'the', u'mayor', u'shows', u'his', u'lack', u'of', u'interest']
+>>> print(bigram[sent])
+[u'the', u'mayor', u'shows', u'his', u'lack_of_interest']
+
+
 .. [1] Tomas Mikolov, Ilya Sutskever, Kai Chen, Greg Corrado, and Jeffrey Dean.
        Distributed Representations of Words and Phrases and their Compositionality.
        In Proceedings of NIPS, 2013.
@@ -65,7 +81,7 @@ import warnings
 from collections import defaultdict
 import itertools as it
 
-from six import iteritems, string_types, next
+from six import iterbytes, iteritems, string_types, next
 
 from gensim import utils, interfaces
 
@@ -96,6 +112,27 @@ def _is_single(obj):
         return False, obj_iter
 
 
+def lrsentence(sentence, delimiter, common_terms):
+    """given a sentence craft a first sentence where common_terms where removed
+    and a left one where they are merged with the following "uncommon" term.
+
+    :return tuple: sentence without common_terms, sentence with merged common_terms
+    """
+    # first part does not us stop words
+    lsentence = [w for w in sentence if w not in common_terms]
+    # second sentence join stop words and following word
+    rsentence = []
+    cterms = []
+    for w in sentence:
+        if w in common_terms:
+            cterms.append(w)
+        else:
+            w = delimiter.join(cterms + [w])
+            rsentence.append(w)
+            cterms = []
+    return lsentence, rsentence
+
+
 class Phrases(interfaces.TransformationABC):
     """
     Detect phrases, based on collected collocation counts. Adjacent words that appear
@@ -106,7 +143,8 @@ class Phrases(interfaces.TransformationABC):
 
     """
     def __init__(self, sentences=None, min_count=5, threshold=10.0,
-                 max_vocab_size=40000000, delimiter=b'_', progress_per=10000):
+                 max_vocab_size=40000000, delimiter=b'_', progress_per=10000,
+                 common_terms=frozenset()):
         """
         Initialize the model from an iterable of `sentences`. Each sentence must be
         a list of words (unicode strings) that will be used for training.
@@ -133,6 +171,8 @@ class Phrases(interfaces.TransformationABC):
         `delimiter` is the glue character used to join collocation tokens, and
         should be a byte string (e.g. b'_').
 
+        `common_terms` is an optionnal list of "stop words" that won't affect frequency count
+        of expressions containing them.
         """
         if min_count <= 0:
             raise ValueError("min_count should be at least 1")
@@ -147,6 +187,7 @@ class Phrases(interfaces.TransformationABC):
         self.min_reduce = 1  # ignore any tokens with count smaller than this
         self.delimiter = delimiter
         self.progress_per = progress_per
+        self.common_terms = frozenset(utils.any2utf8(w) for w in common_terms)
 
         if sentences is not None:
             self.add_vocab(sentences)
@@ -158,7 +199,8 @@ class Phrases(interfaces.TransformationABC):
             self.threshold, self.max_vocab_size)
 
     @staticmethod
-    def learn_vocab(sentences, max_vocab_size, delimiter=b'_', progress_per=10000):
+    def learn_vocab(sentences, max_vocab_size, delimiter=b'_', progress_per=10000,
+                    common_terms=frozenset()):
         """Collect unigram/bigram counts from the `sentences` iterable."""
         sentence_no = -1
         total_words = 0
@@ -170,13 +212,17 @@ class Phrases(interfaces.TransformationABC):
                 logger.info("PROGRESS: at sentence #%i, processed %i words and %i word types" %
                             (sentence_no, total_words, len(vocab)))
             sentence = [utils.any2utf8(w) for w in sentence]
-            for bigram in zip(sentence, sentence[1:]):
+            if common_terms:
+                lsentence, rsentence = lrsentence(sentence, delimiter, common_terms)
+            else:
+                lsentence, rsentence = sentence, sentence
+            for bigram in zip(lsentence, rsentence[1:]):
                 vocab[bigram[0]] += 1
                 vocab[delimiter.join(bigram)] += 1
                 total_words += 1
 
-            if sentence:  # add last word skipped by previous loop
-                word = sentence[-1]
+            if lsentence:  # add last word skipped by previous loop
+                word = lsentence[-1]
                 vocab[word] += 1
 
             if len(vocab) > max_vocab_size:
@@ -197,7 +243,8 @@ class Phrases(interfaces.TransformationABC):
         # directly, but gives the new sentences a fighting chance to collect
         # sufficient counts, before being pruned out by the (large) accummulated
         # counts collected in previous learn_vocab runs.
-        min_reduce, vocab = self.learn_vocab(sentences, self.max_vocab_size, self.delimiter, self.progress_per)
+        min_reduce, vocab = self.learn_vocab(
+            sentences, self.max_vocab_size, self.delimiter, self.progress_per, self.common_terms)
 
         if len(self.vocab) > 0:
             logger.info("merging %i counts into %s", len(vocab), self)
@@ -226,19 +273,24 @@ class Phrases(interfaces.TransformationABC):
 
             then you can debug the threshold with generated tsv
         """
+        threshold = self.threshold
+        delimiter = self.delimiter  # delimiter used for lookup
+        min_count = self.min_count
+        vocab = self.vocab
+        common_terms = self.common_terms
         for sentence in sentences:
             s = [utils.any2utf8(w) for w in sentence]
             last_bigram = False
-            vocab = self.vocab
-            threshold = self.threshold
-            delimiter = self.delimiter  # delimiter used for lookup
-            min_count = self.min_count
-            for word_a, word_b in zip(s, s[1:]):
-                if word_a in vocab and word_b in vocab:
+            if common_terms:
+                lsentence, rsentence = lrsentence(s, delimiter, common_terms)
+            else:
+                lsentence, rsentence = s, s
+            for word_a, word_b, orig_b in zip(lsentence, rsentence[1:], lsentence[1:]):
+                if word_a in vocab and orig_b in vocab:
                     bigram_word = delimiter.join((word_a, word_b))
                     if bigram_word in vocab and not last_bigram:
                         pa = float(vocab[word_a])
-                        pb = float(vocab[word_b])
+                        pb = float(vocab[orig_b])
                         pab = float(vocab[bigram_word])
                         score = (pab - min_count) / pa / pb * len(vocab)
                         # logger.debug("score for %s: (pab=%s - min_count=%s) / pa=%s / pb=%s * vocab_size=%s = %s",
@@ -247,7 +299,8 @@ class Phrases(interfaces.TransformationABC):
                             if as_tuples:
                                 yield ((word_a, word_b), score)
                             else:
-                                yield (out_delimiter.join((word_a, word_b)), score)
+                                components = [word_a] + list(word_b.split(delimiter))
+                                yield (out_delimiter.join(components), score)
                             last_bigram = True
                             continue
                     last_bigram = False
@@ -284,13 +337,19 @@ class Phrases(interfaces.TransformationABC):
         vocab = self.vocab
         threshold = self.threshold
         delimiter = self.delimiter
+        odelimiter = ord(delimiter)
         min_count = self.min_count
-        for word_a, word_b in zip(s, s[1:]):
-            if word_a in vocab and word_b in vocab:
+        common_terms = self.common_terms
+        if common_terms:
+            lsentence, rsentence = lrsentence(s, delimiter, common_terms)
+        else:
+            lsentence, rsentence = s, s
+        for word_a, word_b, orig_b in zip(lsentence, rsentence[1:], lsentence[1:]):
+            if word_a in vocab and orig_b in vocab:
                 bigram_word = delimiter.join((word_a, word_b))
                 if bigram_word in vocab and not last_bigram:
                     pa = float(vocab[word_a])
-                    pb = float(vocab[word_b])
+                    pb = float(vocab[orig_b])
                     pab = float(vocab[bigram_word])
                     score = (pab - min_count) / pa / pb * len(vocab)
                     # logger.debug("score for %s: (pab=%s - min_count=%s) / pa=%s / pb=%s * vocab_size=%s = %s",
@@ -302,6 +361,13 @@ class Phrases(interfaces.TransformationABC):
 
             if not last_bigram:
                 new_s.append(word_a)
+                if common_terms:
+                    # output eventual common terms in front of b
+                    last_stop_index = 0
+                    for i, w in enumerate(iterbytes(word_b)):
+                        if w == odelimiter:
+                            new_s.append(word_b[last_stop_index:i])
+                            last_stop_index = i + 1
             last_bigram = False
 
         if s:  # add last word skipped by previous loop
@@ -312,14 +378,17 @@ class Phrases(interfaces.TransformationABC):
         return [utils.to_unicode(w) for w in new_s]
 
 
-def pseudocorpus(source_vocab, sep):
+def pseudocorpus(source_vocab, sep, common_terms=frozenset()):
     """Feeds source_vocab's compound keys back to it, to discover phrases"""
     for k in source_vocab:
         if sep not in k:
             continue
         unigrams = k.split(sep)
         for i in range(1, len(unigrams)):
-            yield [sep.join(unigrams[:i]), sep.join(unigrams[i:])]
+            if unigrams[i-1] not in common_terms:
+                # do not join common terms
+                cterms = list(it.takewhile(lambda w: w in common_terms, unigrams[i:]))
+                yield [sep.join(unigrams[:i])] + cterms + [sep.join(unigrams[i + len(cterms):])]
 
 
 class Phraser(interfaces.TransformationABC):
@@ -338,8 +407,9 @@ class Phraser(interfaces.TransformationABC):
         self.threshold = phrases_model.threshold
         self.min_count = phrases_model.min_count
         self.delimiter = phrases_model.delimiter
+        self.common_terms = phrases_model.common_terms
         self.phrasegrams = {}
-        corpus = pseudocorpus(phrases_model.vocab, phrases_model.delimiter)
+        corpus = self.pseudocorpus(phrases_model)
         logger.info('source_vocab length %i', len(phrases_model.vocab))
         count = 0
         for bigram, score in phrases_model.export_phrases(corpus, self.delimiter, as_tuples=True):
@@ -350,6 +420,10 @@ class Phraser(interfaces.TransformationABC):
             if not count % 50000:
                 logger.info('Phraser added %i phrasegrams', count)
         logger.info('Phraser built with %i %i phrasegrams', count, len(self.phrasegrams))
+
+    def pseudocorpus(self, phrases_model):
+        return pseudocorpus(phrases_model.vocab, phrases_model.delimiter,
+                            phrases_model.common_terms)
 
     def __getitem__(self, sentence):
         """
@@ -372,9 +446,15 @@ class Phraser(interfaces.TransformationABC):
         last_bigram = False
         phrasegrams = self.phrasegrams
         delimiter = self.delimiter
-        for word_a, word_b in zip(s, s[1:]):
+        odelimiter = ord(delimiter)
+        common_terms = self.common_terms
+        if common_terms:
+            lsentence, rsentence = lrsentence(s, delimiter, common_terms)
+        else:
+            lsentence, rsentence = s, s
+        for word_a, word_b, orig_b in zip(lsentence, rsentence[1:], lsentence[1:]):
             bigram_tuple = (word_a, word_b)
-            if phrasegrams.get(bigram_tuple, (-1, -1))[1] > self.threshold and not last_bigram:
+            if not last_bigram and phrasegrams.get(bigram_tuple, (-1, -1))[1] > self.threshold:
                 bigram_word = delimiter.join((word_a, word_b))
                 new_s.append(bigram_word)
                 last_bigram = True
@@ -382,6 +462,13 @@ class Phraser(interfaces.TransformationABC):
 
             if not last_bigram:
                 new_s.append(word_a)
+                if common_terms:
+                    last_stop_index = 0
+                    # common terms in front of b
+                    for i, w in enumerate(iterbytes(word_b)):
+                        if w == odelimiter:
+                            new_s.append(word_b[last_stop_index:i])
+                            last_stop_index = i + 1
             last_bigram = False
 
         if s:  # add last word skipped by previous loop
